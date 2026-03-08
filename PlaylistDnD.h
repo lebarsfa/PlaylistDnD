@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "M3UUtils.h"
 #include <random>
+#include <windows.h>
 #include <shlobj.h>      // FILEGROUPDESCRIPTOR, FILEDESCRIPTOR
 #include <shlwapi.h>     // SHCreateStreamOnFileEx
 #include <objidl.h>      // IStream
@@ -128,27 +129,93 @@ inline std::wstring FormatIdToName(UINT cf)
 	return std::wstring(buf);
 }
 
-// Replace your CreateShellIDListHGlobal with this implementation
+// It will log the cItems and each resolved display name (for debugging only).
+inline void DebugDumpCIDA(HGLOBAL hg) {
+	if (!hg) { OutputDebugStringW(L"DebugDumpCIDA: hg==NULL\n"); return; }
+	BYTE* mem = (BYTE*)GlobalLock(hg);
+	if (!mem) { OutputDebugStringW(L"DebugDumpCIDA: GlobalLock failed\n"); return; }
+	UINT cidl = *(UINT*)mem;
+	wchar_t buf[512];
+	swprintf_s(buf, L"DebugDumpCIDA: cItems=%u\n", cidl);
+	OutputDebugStringW(buf);
+	UINT* offsets = (UINT*)(mem + sizeof(UINT));
+	// parent PIDL at offsets[0]
+	LPITEMIDLIST pidlParent = (LPITEMIDLIST)(mem + offsets[0]);
+	for (UINT i = 0; i < cidl; ++i) {
+		LPITEMIDLIST pidlItem = (LPITEMIDLIST)(mem + offsets[1 + i]);
+		// combine parent + item to get full PIDL
+		LPITEMIDLIST pidlFull = ILCombine(pidlParent, pidlItem);
+		if (pidlFull) {
+			PWSTR name = nullptr;
+			if (SUCCEEDED(SHGetNameFromIDList(pidlFull, SIGDN_FILESYSPATH, &name)) && name) {
+				swprintf_s(buf, L"  item %u -> %s\n", i, name);
+				OutputDebugStringW(buf);
+				CoTaskMemFree(name);
+			}
+			else {
+				// fallback to display name
+				if (SUCCEEDED(SHGetNameFromIDList(pidlFull, SIGDN_NORMALDISPLAY, &name)) && name) {
+					swprintf_s(buf, L"  item %u -> (display) %s\n", i, name);
+					OutputDebugStringW(buf);
+					CoTaskMemFree(name);
+				}
+				else {
+					swprintf_s(buf, L"  item %u -> (could not resolve)\n", i);
+					OutputDebugStringW(buf);
+				}
+			}
+			CoTaskMemFree(pidlFull);
+		}
+		else {
+			swprintf_s(buf, L"  item %u -> ILCombine failed\n", i);
+			OutputDebugStringW(buf);
+		}
+	}
+	GlobalUnlock(hg);
+}
+
 inline HGLOBAL CreateShellIDListHGlobal(const std::vector<std::wstring>& paths)
 {
 	if (paths.empty()) return NULL;
 
-	// compute common parent folder
-	std::wstring parent = paths[0];
-	size_t pos = parent.find_last_of(L"\\/");
-	if (pos == std::wstring::npos) parent = L"";
-	else parent = parent.substr(0, pos);
+	// 1) compute common parent folder path (longest common directory prefix)
+	auto common_parent = [](const std::vector<std::wstring>& pths)->std::wstring {
+		if (pths.empty()) return L"";
+		std::wstring prefix = pths[0];
+		size_t pos = prefix.find_last_of(L"\\/");
+		if (pos != std::wstring::npos) prefix = prefix.substr(0, pos);
+		else prefix.clear();
+		for (size_t i = 1; i < pths.size() && !prefix.empty(); ++i) {
+			std::wstring s = pths[i];
+			size_t p = s.find_last_of(L"\\/");
+			if (p != std::wstring::npos) s = s.substr(0, p);
+			else s.clear();
+			// shorten prefix to match s
+			size_t j = 0;
+			size_t limit = min(prefix.size(), s.size());
+			while (j < limit && towlower(prefix[j]) == towlower(s[j])) ++j;
+			// roll back to last path separator
+			size_t sep = prefix.rfind(L'\\', j);
+			size_t sep2 = prefix.rfind(L'/', j);
+			size_t cut = max(sep, sep2);
+			if (cut == std::wstring::npos) { prefix.clear(); break; }
+			prefix.resize(cut);
+		}
+		return prefix;
+		};
 
-	// get PIDL for parent folder
+	std::wstring parentPath = common_parent(paths);
+
+	// 2) get parent PIDL (if empty parent, use desktop PIDL as single zero PIDL)
 	LPITEMIDLIST pidlParent = nullptr;
-	HRESULT hr = SHParseDisplayName(parent.c_str(), NULL, &pidlParent, 0, NULL);
-	if (FAILED(hr) || !pidlParent) {
-		// fallback: try desktop as parent (empty)
-		hr = SHGetDesktopFolder(nullptr);
-		// if we can't get parent, still try to build CIDA with item-only PIDLs (less ideal)
+	if (!parentPath.empty()) {
+		if (FAILED(SHParseDisplayName(parentPath.c_str(), NULL, &pidlParent, 0, NULL))) {
+			pidlParent = nullptr;
+		}
 	}
 
-	// collect item SHITEMIDs (last ID only) and their sizes
+	// 3) build item SHITEMID buffers (last ID only)
+	// collect item buffers (either last SHITEMID if parent exists, or full PIDL if parent missing)
 	struct ItemBuf { BYTE* data; SIZE_T size; };
 	std::vector<ItemBuf> items;
 	items.reserve(paths.size());
@@ -156,54 +223,66 @@ inline HGLOBAL CreateShellIDListHGlobal(const std::vector<std::wstring>& paths)
 	for (auto& p : paths) {
 		LPITEMIDLIST pidlFull = nullptr;
 		if (SUCCEEDED(SHParseDisplayName(p.c_str(), NULL, &pidlFull, 0, NULL)) && pidlFull) {
-			// find last SHITEMID within pidlFull
-			PBYTE pb = (PBYTE)pidlFull;
-			// walk to last SHITEMID
-			PBYTE last = pb;
-			while (true) {
-				// each SHITEMID: USHORT cb; followed by cb bytes; terminator is 0 USHORT
-				USHORT cb = *(USHORT*)last;
-				if (cb == 0) break;
-				PBYTE next = last + cb;
-				// check if next is terminator
-				USHORT nextcb = *(USHORT*)next;
-				if (nextcb == 0) {
-					// last currently points to the last SHITEMID
-					break;
+			if (pidlParent) {
+				// parent exists: store only the last SHITEMID (compact form)
+				PBYTE cur = (PBYTE)pidlFull;
+				PBYTE last = cur;
+				while (true) {
+					USHORT cb = *(USHORT*)cur;
+					if (cb == 0) break;
+					PBYTE next = cur + cb;
+					USHORT nextcb = *(USHORT*)next;
+					if (nextcb == 0) { last = cur; break; }
+					cur = next;
 				}
-				last = next;
+				USHORT lastcb = *(USHORT*)last;
+				SIZE_T singleSize = (SIZE_T)lastcb + sizeof(USHORT); // include trailing size field
+				BYTE* buf = (BYTE*)CoTaskMemAlloc(singleSize + sizeof(USHORT));
+				if (buf) {
+					memcpy(buf, last, singleSize);
+					USHORT term = 0;
+					memcpy(buf + singleSize, &term, sizeof(term));
+					items.push_back({ buf, singleSize + sizeof(term) });
+				}
+				else {
+					items.push_back({ nullptr, 0 });
+				}
+				CoTaskMemFree(pidlFull);
 			}
-			// size of that single SHITEMID (cb + sizeof(cb) already included)
-			USHORT lastcb = *(USHORT*)last;
-			SIZE_T itemSize = lastcb + sizeof(USHORT); // include terminating size field
-			// allocate buffer and copy the single SHITEMID plus terminating 0 WORD
-			BYTE* buf = (BYTE*)CoTaskMemAlloc(itemSize + sizeof(USHORT)); // ensure space for terminator
-			if (buf) {
-				memcpy(buf, last, itemSize);
-				// append a terminating zero WORD if not present
-				USHORT term = 0;
-				memcpy(buf + itemSize, &term, sizeof(term));
-				items.push_back({ buf, itemSize + sizeof(term) });
+			else {
+				// parent missing: store the full absolute PIDL bytes (so items are absolute)
+				SIZE_T fullSize = ILGetSize(pidlFull);
+				BYTE* buf = (BYTE*)CoTaskMemAlloc(fullSize);
+				if (buf) {
+					memcpy(buf, pidlFull, fullSize);
+					items.push_back({ buf, fullSize });
+				}
+				else {
+					items.push_back({ nullptr, 0 });
+				}
+				CoTaskMemFree(pidlFull);
 			}
-			CoTaskMemFree(pidlFull);
 		}
 		else {
-			// if parsing failed, push an empty item (single zero WORD)
+			// parsing failed: push a single zero WORD as a placeholder
 			BYTE* buf = (BYTE*)CoTaskMemAlloc(sizeof(USHORT));
 			if (buf) {
 				USHORT term = 0;
 				memcpy(buf, &term, sizeof(term));
 				items.push_back({ buf, sizeof(USHORT) });
 			}
+			else {
+				items.push_back({ nullptr, 0 });
+			}
 		}
 	}
 
-	// parent PIDL bytes size
+	// 4) parent bytes
 	SIZE_T parentSize = 0;
 	BYTE* parentBytes = nullptr;
 	if (pidlParent) {
 		parentSize = ILGetSize(pidlParent);
-		parentBytes = (BYTE*)pidlParent; // will free later with CoTaskMemFree
+		parentBytes = (BYTE*)pidlParent; // will free with CoTaskMemFree
 	}
 	else {
 		// empty parent -> single zero WORD
@@ -215,13 +294,14 @@ inline HGLOBAL CreateShellIDListHGlobal(const std::vector<std::wstring>& paths)
 		}
 	}
 
+	// 5) allocate HGLOBAL for CIDA: DWORD cidl + DWORD offsets[cidl+1] + pidl bytes
 	UINT cItems = (UINT)items.size();
-	SIZE_T headerSize = sizeof(UINT) + (cItems + 1) * sizeof(UINT); // cidl + offsets[0..cItems]
-	SIZE_T totalPidlsSize = parentSize;
-	for (auto& it : items) totalPidlsSize += it.size;
-	SIZE_T total = headerSize + totalPidlsSize;
+	SIZE_T headerSize = sizeof(UINT) + (cItems + 1) * sizeof(UINT);
+	SIZE_T pidlsSize = parentSize;
+	for (auto& it : items) pidlsSize += it.size;
+	SIZE_T total = headerSize + pidlsSize;
 
-	HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, total);
+	HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, total);
 	if (!hg) {
 		if (pidlParent) CoTaskMemFree(pidlParent);
 		else if (parentBytes) CoTaskMemFree(parentBytes);
@@ -238,26 +318,31 @@ inline HGLOBAL CreateShellIDListHGlobal(const std::vector<std::wstring>& paths)
 		return NULL;
 	}
 
-	// write header
 	UINT* pu = (UINT*)mem;
 	pu[0] = cItems;
-	// offsets: aoffset[0] = offset to parent PIDL (immediately after header)
 	SIZE_T cur = headerSize;
+	// offset to parent
 	pu[1] = (UINT)cur;
-	// copy parent PIDL bytes
 	memcpy(mem + cur, parentBytes, parentSize);
 	cur += parentSize;
-
 	// offsets for each item
 	for (UINT i = 0; i < cItems; ++i) {
 		pu[2 + i] = (UINT)cur;
-		memcpy(mem + cur, items[i].data, items[i].size);
-		cur += items[i].size;
+		if (items[i].data && items[i].size) {
+			memcpy(mem + cur, items[i].data, items[i].size);
+			cur += items[i].size;
+		}
+		else {
+			// write a single zero WORD
+			USHORT term = 0;
+			memcpy(mem + cur, &term, sizeof(term));
+			cur += sizeof(term);
+		}
 	}
 
 	GlobalUnlock(hg);
 
-	// free temporary buffers
+	// cleanup temporaries
 	if (pidlParent) CoTaskMemFree(pidlParent);
 	else if (parentBytes) CoTaskMemFree(parentBytes);
 	for (auto& it : items) if (it.data) CoTaskMemFree(it.data);
@@ -277,7 +362,7 @@ public:
 		for (auto& p : paths) totalWchars += p.size() + 1;
 		totalWchars += 1;
 		SIZE_T bytes = sizeof(DROPFILES) + totalWchars * sizeof(wchar_t);
-		_hDrop = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+		_hDrop = GlobalAlloc(GMEM_MOVEABLE, bytes);
 		if (!_hDrop) return;
 
 		BYTE* mem = (BYTE*)GlobalLock(_hDrop);
@@ -296,6 +381,15 @@ public:
 		}
 		*cur = L'\0';
 		GlobalUnlock(_hDrop);
+
+		// debug log
+		HDROP hdrop = (HDROP)GlobalLock(_hDrop);
+		if (hdrop) {
+			UINT cnt = DragQueryFileW(hdrop, 0xFFFFFFFF, NULL, 0);
+			wchar_t buf[128]; swprintf_s(buf, L"Built CF_HDROP: DragQueryFileW count=%u\n", cnt);
+			OutputDebugStringW(buf);
+			GlobalUnlock(_hDrop);
+		}
 	}
 
 	~FileDropDataObject() {
@@ -331,12 +425,24 @@ public:
 			FormatIdToName(pFormatEtc->cfFormat).c_str(),
 			pFormatEtc->cfFormat, pFormatEtc->tymed, pFormatEtc->lindex);
 		OutputDebugStringW(dbg);
+		if (pFormatEtc->cfFormat == RegisterClipboardFormatW(CFSTR_FILECONTENTS)) {
+			wchar_t dbg2[256];
+			swprintf_s(dbg2, L"GetData CFSTR_FILECONTENTS probe: tymed=0x%X lindex=%d\n", pFormatEtc->tymed, pFormatEtc->lindex);
+			OutputDebugStringW(dbg2);
+		}
+		if (pFormatEtc->cfFormat == CF_HDROP) {
+			// debug log
+			wchar_t dbg3[1024];
+			swprintf_s(dbg3, L"Returning CF_HDROP with %zu paths\n", _paths.size());
+			OutputDebugStringW(dbg3);
+			for (auto& pp : _paths) { OutputDebugStringW(pp.c_str()); OutputDebugStringW(L"\n"); }
+		}
 
 		// CF_HDROP (TYMED_HGLOBAL)
 		if ((pFormatEtc->cfFormat == CF_HDROP) && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
 			if (!_hDrop) return E_FAIL;
 			SIZE_T size = GlobalSize(_hDrop);
-			HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, size);
+			HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, size);
 			if (!hg) return E_OUTOFMEMORY;
 			void* src = GlobalLock(_hDrop);
 			void* dst = GlobalLock(hg);
@@ -367,7 +473,7 @@ public:
 				if (i + 1 < _paths.size()) urls += L"\r\n";
 			}
 			SIZE_T bytes = (urls.size() + 1) * sizeof(wchar_t);
-			HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+			HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
 			if (!hg) return E_OUTOFMEMORY;
 			void* dst = GlobalLock(hg);
 			memcpy(dst, urls.c_str(), bytes);
@@ -381,7 +487,7 @@ public:
 		// CF_PREFERREDDROPEFFECT - DWORD with DROPEFFECT_COPY
 		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
 		if (pFormatEtc->cfFormat == cfPref && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
-			HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DWORD));
+			HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
 			if (!hg) return E_OUTOFMEMORY;
 			void* dst = GlobalLock(hg);
 			DWORD effect = DROPEFFECT_COPY;
@@ -439,7 +545,7 @@ public:
 				SIZE_T bytes = (SIZE_T)li.QuadPart;
 				if (bytes == 0) {
 					CloseHandle(hFile); // empty file -> return empty HGLOBAL
-					HGLOBAL hgEmpty = GlobalAlloc(GHND | GMEM_SHARE, 1);
+					HGLOBAL hgEmpty = GlobalAlloc(GMEM_MOVEABLE, 1);
 					if (!hgEmpty) return E_OUTOFMEMORY;
 					void* dstEmpty = GlobalLock(hgEmpty);
 					*((char*)dstEmpty) = 0;
@@ -451,7 +557,7 @@ public:
 				}
 				// guard: avoid huge allocations here; prefer ISTREAM for large files
 				if (bytes > (1 << 26)) { CloseHandle(hFile); return STG_E_MEDIUMFULL; } // ~64MB guard
-				HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+				HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
 				if (!hg) { CloseHandle(hFile); return E_OUTOFMEMORY; }
 				void* dst = GlobalLock(hg);
 				DWORD read = 0;
@@ -472,6 +578,7 @@ public:
 		if (pFormatEtc->cfFormat == cfShellIDList && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
 			HGLOBAL hg = CreateShellIDListHGlobal(_paths);
 			if (!hg) return E_OUTOFMEMORY;
+			DebugDumpCIDA(hg); // debug log the contents of the CIDA being returned
 			pMedium->tymed = TYMED_HGLOBAL;
 			pMedium->hGlobal = hg;
 			pMedium->pUnkForRelease = nullptr;
@@ -482,7 +589,7 @@ public:
 	}
 
 	HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
-
+#ifdef TESTING_QUERYGETDATA
 	HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* pFormatEtc) override {
 		if (!pFormatEtc) return E_POINTER;
 
@@ -514,7 +621,13 @@ public:
 
 		return DV_E_FORMATETC;
 	}
-
+#else
+	HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* pFormatEtc) override {
+		if (!pFormatEtc) return E_POINTER;
+		if ((pFormatEtc->cfFormat == CF_HDROP) && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+		return DV_E_FORMATETC;
+	}
+#endif // TESTING_QUERYGETDATA
 	HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC* pFormatEtc, FORMATETC* pFormatEtcOut) override {
 		if (!pFormatEtcOut) return E_POINTER;
 		*pFormatEtcOut = *pFormatEtc;
@@ -528,9 +641,8 @@ public:
 		if (!ppEnum) return E_POINTER;
 		if (dwDirection != DATADIR_GET) return E_NOTIMPL;
 
-		// Build the list of FORMATETC entries you support
+		// Build the list of FORMATETC entries you support (CF_HDROP first)
 		std::vector<FORMATETC> fmts;
-
 		FORMATETC f = {};
 		f.cfFormat = CF_HDROP; f.tymed = TYMED_HGLOBAL; f.dwAspect = DVASPECT_CONTENT; f.lindex = -1; f.ptd = nullptr;
 		fmts.push_back(f);
@@ -550,7 +662,6 @@ public:
 		UINT cfShellIDList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
 		if (cfShellIDList) { f.cfFormat = (CLIPFORMAT)cfShellIDList; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
 
-		// allocate array and create standard enumerator
 		return SHCreateStdEnumFmtEtc((UINT)fmts.size(), fmts.empty() ? nullptr : &fmts[0], ppEnum);
 	}
 
@@ -563,7 +674,7 @@ private:
 	HGLOBAL CreateFileGroupDescriptorHGlobal() {
 		size_t n = _paths.size();
 		SIZE_T bytes = sizeof(FILEGROUPDESCRIPTORW) + (n ? (n - 1) * sizeof(FILEDESCRIPTORW) : 0);
-		HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+		HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
 		if (!hg) return NULL;
 		FILEGROUPDESCRIPTORW* pgd = (FILEGROUPDESCRIPTORW*)GlobalLock(hg);
 		ZeroMemory(pgd, bytes);
