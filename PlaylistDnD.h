@@ -32,7 +32,7 @@ HWND g_hShuffleBtn = NULL;
 
 // Dark theme colors and brushes
 COLORREF g_clrBg = RGB(28, 28, 36);// RGB(18, 24, 48);        // night blue / violet
-COLORREF g_clrCtrl = RGB(36, 36, 48);// RGB(18, 24, 48);// RGB(28, 34, 64);      // control background (slightly lighter)
+COLORREF g_clrCtrl = RGB(28, 28, 36);// RGB(36, 36, 48);// RGB(18, 24, 48);// RGB(28, 34, 64);      // control background (slightly lighter)
 COLORREF g_clrText = RGB(240, 235, 220);// RGB(230, 230, 250);   // light text
 COLORREF g_clrEvenCol = RGB(44, 44, 64);// RGB(36, 44, 84);
 COLORREF g_clrOddCol = RGB(48, 60, 80);// RGB(42, 64, 104);
