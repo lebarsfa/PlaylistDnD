@@ -4,6 +4,11 @@
 #include "Utils.h"
 #include "M3UUtils.h"
 #include <random>
+#include <shlobj.h>      // FILEGROUPDESCRIPTOR, FILEDESCRIPTOR
+#include <shlwapi.h>     // SHCreateStreamOnFileEx
+#include <objidl.h>      // IStream
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 // Globals
 HINSTANCE g_hInst = NULL;
@@ -104,11 +109,170 @@ inline HFONT CreateUiFont(HWND hwnd, const wchar_t* faceName, int pointSize)
 	return CreateFontIndirectW(&lf);
 }
 
+inline std::wstring FormatIdToName(UINT cf)
+{
+	wchar_t name[256] = {};
+	if (cf < 0xC000) {
+		switch (cf) {
+		case CF_HDROP: return L"CF_HDROP";
+		case CF_TEXT: return L"CF_TEXT";
+		case CF_UNICODETEXT: return L"CF_UNICODETEXT";
+		default: break;
+		}
+	}
+	if (GetClipboardFormatNameW(cf, name, ARRAYSIZE(name)) > 0) {
+		return std::wstring(name);
+	}
+	wchar_t buf[64];
+	swprintf_s(buf, L"CF_0x%04X", cf);
+	return std::wstring(buf);
+}
+
+// Replace your CreateShellIDListHGlobal with this implementation
+inline HGLOBAL CreateShellIDListHGlobal(const std::vector<std::wstring>& paths)
+{
+	if (paths.empty()) return NULL;
+
+	// compute common parent folder
+	std::wstring parent = paths[0];
+	size_t pos = parent.find_last_of(L"\\/");
+	if (pos == std::wstring::npos) parent = L"";
+	else parent = parent.substr(0, pos);
+
+	// get PIDL for parent folder
+	LPITEMIDLIST pidlParent = nullptr;
+	HRESULT hr = SHParseDisplayName(parent.c_str(), NULL, &pidlParent, 0, NULL);
+	if (FAILED(hr) || !pidlParent) {
+		// fallback: try desktop as parent (empty)
+		hr = SHGetDesktopFolder(nullptr);
+		// if we can't get parent, still try to build CIDA with item-only PIDLs (less ideal)
+	}
+
+	// collect item SHITEMIDs (last ID only) and their sizes
+	struct ItemBuf { BYTE* data; SIZE_T size; };
+	std::vector<ItemBuf> items;
+	items.reserve(paths.size());
+
+	for (auto& p : paths) {
+		LPITEMIDLIST pidlFull = nullptr;
+		if (SUCCEEDED(SHParseDisplayName(p.c_str(), NULL, &pidlFull, 0, NULL)) && pidlFull) {
+			// find last SHITEMID within pidlFull
+			PBYTE pb = (PBYTE)pidlFull;
+			// walk to last SHITEMID
+			PBYTE last = pb;
+			while (true) {
+				// each SHITEMID: USHORT cb; followed by cb bytes; terminator is 0 USHORT
+				USHORT cb = *(USHORT*)last;
+				if (cb == 0) break;
+				PBYTE next = last + cb;
+				// check if next is terminator
+				USHORT nextcb = *(USHORT*)next;
+				if (nextcb == 0) {
+					// last currently points to the last SHITEMID
+					break;
+				}
+				last = next;
+			}
+			// size of that single SHITEMID (cb + sizeof(cb) already included)
+			USHORT lastcb = *(USHORT*)last;
+			SIZE_T itemSize = lastcb + sizeof(USHORT); // include terminating size field
+			// allocate buffer and copy the single SHITEMID plus terminating 0 WORD
+			BYTE* buf = (BYTE*)CoTaskMemAlloc(itemSize + sizeof(USHORT)); // ensure space for terminator
+			if (buf) {
+				memcpy(buf, last, itemSize);
+				// append a terminating zero WORD if not present
+				USHORT term = 0;
+				memcpy(buf + itemSize, &term, sizeof(term));
+				items.push_back({ buf, itemSize + sizeof(term) });
+			}
+			CoTaskMemFree(pidlFull);
+		}
+		else {
+			// if parsing failed, push an empty item (single zero WORD)
+			BYTE* buf = (BYTE*)CoTaskMemAlloc(sizeof(USHORT));
+			if (buf) {
+				USHORT term = 0;
+				memcpy(buf, &term, sizeof(term));
+				items.push_back({ buf, sizeof(USHORT) });
+			}
+		}
+	}
+
+	// parent PIDL bytes size
+	SIZE_T parentSize = 0;
+	BYTE* parentBytes = nullptr;
+	if (pidlParent) {
+		parentSize = ILGetSize(pidlParent);
+		parentBytes = (BYTE*)pidlParent; // will free later with CoTaskMemFree
+	}
+	else {
+		// empty parent -> single zero WORD
+		parentSize = sizeof(USHORT);
+		parentBytes = (BYTE*)CoTaskMemAlloc(parentSize);
+		if (parentBytes) {
+			USHORT term = 0;
+			memcpy(parentBytes, &term, sizeof(term));
+		}
+	}
+
+	UINT cItems = (UINT)items.size();
+	SIZE_T headerSize = sizeof(UINT) + (cItems + 1) * sizeof(UINT); // cidl + offsets[0..cItems]
+	SIZE_T totalPidlsSize = parentSize;
+	for (auto& it : items) totalPidlsSize += it.size;
+	SIZE_T total = headerSize + totalPidlsSize;
+
+	HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, total);
+	if (!hg) {
+		if (pidlParent) CoTaskMemFree(pidlParent);
+		else if (parentBytes) CoTaskMemFree(parentBytes);
+		for (auto& it : items) if (it.data) CoTaskMemFree(it.data);
+		return NULL;
+	}
+
+	BYTE* mem = (BYTE*)GlobalLock(hg);
+	if (!mem) {
+		GlobalFree(hg);
+		if (pidlParent) CoTaskMemFree(pidlParent);
+		else if (parentBytes) CoTaskMemFree(parentBytes);
+		for (auto& it : items) if (it.data) CoTaskMemFree(it.data);
+		return NULL;
+	}
+
+	// write header
+	UINT* pu = (UINT*)mem;
+	pu[0] = cItems;
+	// offsets: aoffset[0] = offset to parent PIDL (immediately after header)
+	SIZE_T cur = headerSize;
+	pu[1] = (UINT)cur;
+	// copy parent PIDL bytes
+	memcpy(mem + cur, parentBytes, parentSize);
+	cur += parentSize;
+
+	// offsets for each item
+	for (UINT i = 0; i < cItems; ++i) {
+		pu[2 + i] = (UINT)cur;
+		memcpy(mem + cur, items[i].data, items[i].size);
+		cur += items[i].size;
+	}
+
+	GlobalUnlock(hg);
+
+	// free temporary buffers
+	if (pidlParent) CoTaskMemFree(pidlParent);
+	else if (parentBytes) CoTaskMemFree(parentBytes);
+	for (auto& it : items) if (it.data) CoTaskMemFree(it.data);
+
+	return hg;
+}
+
 class FileDropDataObject : public IDataObject {
 	LONG _ref;
 	HGLOBAL _hDrop;
+	std::vector<std::wstring> _paths;
+
 public:
-	FileDropDataObject(const std::vector<std::wstring>& paths) : _ref(1), _hDrop(NULL) {
+	FileDropDataObject(const std::vector<std::wstring>& paths) : _ref(1), _hDrop(NULL), _paths(paths) {
+		// build CF_HDROP HGLOBAL (Unicode)
 		size_t totalWchars = 0;
 		for (auto& p : paths) totalWchars += p.size() + 1;
 		totalWchars += 1;
@@ -138,8 +302,37 @@ public:
 		if (_hDrop) GlobalFree(_hDrop);
 	}
 
+	// IUnknown
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+		if (!ppvObject) return E_POINTER;
+		if (riid == IID_IUnknown || riid == IID_IDataObject) {
+			*ppvObject = static_cast<IDataObject*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppvObject = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef(void) override { return InterlockedIncrement(&_ref); }
+	ULONG STDMETHODCALLTYPE Release(void) override {
+		ULONG c = InterlockedDecrement(&_ref);
+		if (c == 0) delete this;
+		return c;
+	}
+
+	// IDataObject
+
 	HRESULT STDMETHODCALLTYPE GetData(FORMATETC* pFormatEtc, STGMEDIUM* pMedium) override {
 		if (!pFormatEtc || !pMedium) return E_POINTER;
+
+		// debug log
+		wchar_t dbg[512];
+		swprintf_s(dbg, L"GetData: cf=%s (0x%08X) tymed=0x%X lindex=%d\n",
+			FormatIdToName(pFormatEtc->cfFormat).c_str(),
+			pFormatEtc->cfFormat, pFormatEtc->tymed, pFormatEtc->lindex);
+		OutputDebugStringW(dbg);
+
+		// CF_HDROP (TYMED_HGLOBAL)
 		if ((pFormatEtc->cfFormat == CF_HDROP) && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
 			if (!_hDrop) return E_FAIL;
 			SIZE_T size = GlobalSize(_hDrop);
@@ -161,42 +354,246 @@ public:
 			pMedium->pUnkForRelease = nullptr;
 			return S_OK;
 		}
-		return DV_E_FORMATETC;
-	}
 
-	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
-		if (!ppvObject) return E_POINTER;
-		if (riid == IID_IUnknown || riid == IID_IDataObject) {
-			*ppvObject = static_cast<IDataObject*>(this);
-			AddRef();
+		// CFSTR_INETURLW (UniformResourceLocatorW) - UTF-16 newline-separated file:/// URLs
+		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
+		if (pFormatEtc->cfFormat == cfInetUrlW && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			std::wstring urls;
+			for (size_t i = 0; i < _paths.size(); ++i) {
+				const std::wstring& path = _paths[i];
+				std::wstring url = L"file:///";
+				for (wchar_t ch : path) url.push_back(ch == L'\\' ? L'/' : ch);
+				urls += url;
+				if (i + 1 < _paths.size()) urls += L"\r\n";
+			}
+			SIZE_T bytes = (urls.size() + 1) * sizeof(wchar_t);
+			HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+			if (!hg) return E_OUTOFMEMORY;
+			void* dst = GlobalLock(hg);
+			memcpy(dst, urls.c_str(), bytes);
+			GlobalUnlock(hg);
+			pMedium->tymed = TYMED_HGLOBAL;
+			pMedium->hGlobal = hg;
+			pMedium->pUnkForRelease = nullptr;
 			return S_OK;
 		}
-		*ppvObject = nullptr;
-		return E_NOINTERFACE;
-	}
-	ULONG STDMETHODCALLTYPE AddRef(void) override { return InterlockedIncrement(&_ref); }
-	ULONG STDMETHODCALLTYPE Release(void) override {
-		ULONG c = InterlockedDecrement(&_ref);
-		if (c == 0) delete this;
-		return c;
+
+		// CF_PREFERREDDROPEFFECT - DWORD with DROPEFFECT_COPY
+		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+		if (pFormatEtc->cfFormat == cfPref && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DWORD));
+			if (!hg) return E_OUTOFMEMORY;
+			void* dst = GlobalLock(hg);
+			DWORD effect = DROPEFFECT_COPY;
+			memcpy(dst, &effect, sizeof(effect));
+			GlobalUnlock(hg);
+			pMedium->tymed = TYMED_HGLOBAL;
+			pMedium->hGlobal = hg;
+			pMedium->pUnkForRelease = nullptr;
+			return S_OK;
+		}
+
+		// CFSTR_FILEDESCRIPTORW - FILEGROUPDESCRIPTORW (TYMED_HGLOBAL)
+		UINT cfFileDesc = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+		if (pFormatEtc->cfFormat == cfFileDesc && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			HGLOBAL hg = CreateFileGroupDescriptorHGlobal();
+			if (!hg) return E_OUTOFMEMORY;
+			pMedium->tymed = TYMED_HGLOBAL;
+			pMedium->hGlobal = hg;
+			pMedium->pUnkForRelease = nullptr;
+			return S_OK;
+		}
+
+		// CFSTR_FILECONTENTS - prefer TYMED_ISTREAM (caller may request ISTREAM)
+		UINT cfFileCont = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+		if (pFormatEtc->cfFormat == cfFileCont) {
+			// debug log the request
+			wchar_t dbg2[256];
+			swprintf_s(dbg2, L"GetData request: CFSTR_FILECONTENTS tymed=0x%X lindex=%d\n", pFormatEtc->tymed, pFormatEtc->lindex);
+			OutputDebugStringW(dbg2);
+
+			LONG idx = pFormatEtc->lindex;
+			if (idx < 0 || (size_t)idx >= _paths.size()) return DV_E_LINDEX;
+
+			// If caller asked for ISTREAM, provide it
+			if (pFormatEtc->tymed & TYMED_ISTREAM) {
+				IStream* pStream = nullptr;
+				HRESULT hr = SHCreateStreamOnFileEx(_paths[idx].c_str(),
+					STGM_READ | STGM_SHARE_DENY_NONE,
+					FILE_ATTRIBUTE_NORMAL, FALSE, NULL, &pStream);
+				if (SUCCEEDED(hr) && pStream) {
+					pMedium->tymed = TYMED_ISTREAM;
+					pMedium->pstm = pStream; // caller will Release()
+					pMedium->pUnkForRelease = nullptr;
+					return S_OK;
+				}
+				// if stream creation failed, fall through to HGLOBAL fallback below (if implemented)
+			}
+
+			// Optional fallback: if caller accepts HGLOBAL, return file bytes in HGLOBAL (only for small files)
+			if (pFormatEtc->tymed & TYMED_HGLOBAL) {
+				HANDLE hFile = CreateFileW(_paths[idx].c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+				if (hFile == INVALID_HANDLE_VALUE) return STG_E_FILENOTFOUND;
+				LARGE_INTEGER li = {};
+				if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); return E_FAIL; }
+				SIZE_T bytes = (SIZE_T)li.QuadPart;
+				if (bytes == 0) {
+					CloseHandle(hFile); // empty file -> return empty HGLOBAL
+					HGLOBAL hgEmpty = GlobalAlloc(GHND | GMEM_SHARE, 1);
+					if (!hgEmpty) return E_OUTOFMEMORY;
+					void* dstEmpty = GlobalLock(hgEmpty);
+					*((char*)dstEmpty) = 0;
+					GlobalUnlock(hgEmpty);
+					pMedium->tymed = TYMED_HGLOBAL;
+					pMedium->hGlobal = hgEmpty;
+					pMedium->pUnkForRelease = nullptr;
+					return S_OK;
+				}
+				// guard: avoid huge allocations here; prefer ISTREAM for large files
+				if (bytes > (1 << 26)) { CloseHandle(hFile); return STG_E_MEDIUMFULL; } // ~64MB guard
+				HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+				if (!hg) { CloseHandle(hFile); return E_OUTOFMEMORY; }
+				void* dst = GlobalLock(hg);
+				DWORD read = 0;
+				BOOL ok = ReadFile(hFile, dst, (DWORD)bytes, &read, NULL);
+				GlobalUnlock(hg);
+				CloseHandle(hFile);
+				if (!ok || read != bytes) { GlobalFree(hg); return E_FAIL; }
+				pMedium->tymed = TYMED_HGLOBAL;
+				pMedium->hGlobal = hg;
+				pMedium->pUnkForRelease = nullptr;
+				return S_OK;
+			}
+
+			return DV_E_FORMATETC;
+		}
+
+		UINT cfShellIDList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
+		if (pFormatEtc->cfFormat == cfShellIDList && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			HGLOBAL hg = CreateShellIDListHGlobal(_paths);
+			if (!hg) return E_OUTOFMEMORY;
+			pMedium->tymed = TYMED_HGLOBAL;
+			pMedium->hGlobal = hg;
+			pMedium->pUnkForRelease = nullptr;
+			return S_OK;
+		}
+
+		return DV_E_FORMATETC;
 	}
 
 	HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+
 	HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* pFormatEtc) override {
 		if (!pFormatEtc) return E_POINTER;
-		if ((pFormatEtc->cfFormat == CF_HDROP) && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		// debug log
+		wchar_t dbg[512];
+		swprintf_s(dbg, L"QueryGetData: cf=%s (0x%08X) tymed=0x%X lindex=%d\n",
+			FormatIdToName(pFormatEtc->cfFormat).c_str(),
+			pFormatEtc->cfFormat, pFormatEtc->tymed, pFormatEtc->lindex);
+		OutputDebugStringW(dbg);
+
+		if (pFormatEtc->cfFormat == CF_HDROP && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
+		if (pFormatEtc->cfFormat == cfInetUrlW && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+		if (pFormatEtc->cfFormat == cfPref && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		UINT cfFileDesc = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+		if (pFormatEtc->cfFormat == cfFileDesc && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		UINT cfFileCont = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+		if (pFormatEtc->cfFormat == cfFileCont) {
+			if (pFormatEtc->tymed & (TYMED_ISTREAM | TYMED_HGLOBAL)) return S_OK;
+		}
+
+		UINT cfShellIDList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST); // "Shell IDList Array"
+		if (pFormatEtc->cfFormat == cfShellIDList && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
 		return DV_E_FORMATETC;
 	}
-	HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* pOut) override {
-		if (!pOut) return E_POINTER;
-		pOut->ptd = nullptr;
-		return E_NOTIMPL;
+
+	HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC* pFormatEtc, FORMATETC* pFormatEtcOut) override {
+		if (!pFormatEtcOut) return E_POINTER;
+		*pFormatEtcOut = *pFormatEtc;
+		pFormatEtcOut->ptd = nullptr;
+		return DATA_S_SAMEFORMATETC;
 	}
+
 	HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
-	HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD, IEnumFORMATETC**) override { return E_NOTIMPL; }
+
+	HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppEnum) override {
+		if (!ppEnum) return E_POINTER;
+		if (dwDirection != DATADIR_GET) return E_NOTIMPL;
+
+		// Build the list of FORMATETC entries you support
+		std::vector<FORMATETC> fmts;
+
+		FORMATETC f = {};
+		f.cfFormat = CF_HDROP; f.tymed = TYMED_HGLOBAL; f.dwAspect = DVASPECT_CONTENT; f.lindex = -1; f.ptd = nullptr;
+		fmts.push_back(f);
+
+		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
+		if (cfInetUrlW) { f.cfFormat = (CLIPFORMAT)cfInetUrlW; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+
+		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+		if (cfPref) { f.cfFormat = (CLIPFORMAT)cfPref; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+
+		UINT cfFileDesc = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+		if (cfFileDesc) { f.cfFormat = (CLIPFORMAT)cfFileDesc; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+
+		UINT cfFileCont = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+		if (cfFileCont) { f.cfFormat = (CLIPFORMAT)cfFileCont; f.tymed = (TYMED_ISTREAM | TYMED_HGLOBAL); fmts.push_back(f); }
+
+		UINT cfShellIDList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
+		if (cfShellIDList) { f.cfFormat = (CLIPFORMAT)cfShellIDList; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+
+		// allocate array and create standard enumerator
+		return SHCreateStdEnumFmtEtc((UINT)fmts.size(), fmts.empty() ? nullptr : &fmts[0], ppEnum);
+	}
+
 	HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return OLE_E_ADVISENOTSUPPORTED; }
 	HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
 	HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
+
+private:
+	// Helper: create FILEGROUPDESCRIPTORW HGLOBAL for _paths
+	HGLOBAL CreateFileGroupDescriptorHGlobal() {
+		size_t n = _paths.size();
+		SIZE_T bytes = sizeof(FILEGROUPDESCRIPTORW) + (n ? (n - 1) * sizeof(FILEDESCRIPTORW) : 0);
+		HGLOBAL hg = GlobalAlloc(GHND | GMEM_SHARE, bytes);
+		if (!hg) return NULL;
+		FILEGROUPDESCRIPTORW* pgd = (FILEGROUPDESCRIPTORW*)GlobalLock(hg);
+		ZeroMemory(pgd, bytes);
+		pgd->cItems = (UINT)n;
+		for (size_t i = 0; i < n; ++i) {
+			FILEDESCRIPTORW& fd = pgd->fgd[i];
+			ZeroMemory(&fd, sizeof(fd));
+			// filename
+			std::wstring name;
+			size_t pos = _paths[i].find_last_of(L"\\/");
+			name = (pos == std::wstring::npos) ? _paths[i] : _paths[i].substr(pos + 1);
+			wcsncpy_s(fd.cFileName, name.c_str(), ARRAYSIZE(fd.cFileName)-1);
+
+			// try to fill size, attributes and time
+			WIN32_FILE_ATTRIBUTE_DATA fad;
+			if (GetFileAttributesExW(_paths[i].c_str(), GetFileExInfoStandard, &fad)) {
+				fd.dwFlags = FD_FILESIZE | FD_ATTRIBUTES | FD_WRITESTIME;
+				ULONGLONG size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+				fd.nFileSizeLow = (DWORD)(size & 0xFFFFFFFF);
+				fd.nFileSizeHigh = (DWORD)(size >> 32);
+				fd.dwFileAttributes = fad.dwFileAttributes;
+				fd.ftLastWriteTime = fad.ftLastWriteTime;
+			}
+			else {
+				fd.dwFlags = 0;
+			}
+		}
+		GlobalUnlock(hg);
+		return hg;
+	}
 };
 
 // IDropTarget implementation to accept .m3u files
