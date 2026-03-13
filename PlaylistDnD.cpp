@@ -289,8 +289,6 @@ void StartDragFromListMulti(HWND hList)
 {
 	if (!IsWindow(hList)) return;
 
-	HRESULT hrCo = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-
 	std::vector<int> indices = GetSelectedListViewIndices(hList);
 	if (indices.empty()) {
 		int focused = ListView_GetNextItem(hList, -1, LVNI_FOCUSED);
@@ -340,8 +338,6 @@ void StartDragFromListMulti(HWND hList)
 
 	pDropSrc->Release();
 	pData->Release();
-
-	if (SUCCEEDED(hrCo)) CoUninitialize();
 }
 
 LRESULT CALLBACK ListboxSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,

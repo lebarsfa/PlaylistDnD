@@ -5,8 +5,57 @@
 #include <algorithm>
 #include "Utils.h"
 
+// Percent-encode a UTF-16 URL string (encode space, control chars, and reserved/unsafe chars).
+inline std::wstring PercentEncodeUrlW(const std::wstring& src)
+{
+    auto is_unreserved = [](wchar_t c)->bool {
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) return true;
+        switch (c) {
+        case L'-': case L'.': case L'_': case L'~': return true;
+        default: return false;
+        }
+    };
+
+    std::wstring out;
+    out.reserve(src.size() * 3);
+    for (wchar_t wc : src) {
+        // encode control, space, non-ASCII, and reserved characters
+        if (is_unreserved(wc)) {
+            out.push_back(wc);
+        }
+        else if (wc < 0x80) {
+            // ASCII -> percent-encode single byte
+            wchar_t buf[4];
+            swprintf_s(buf, L"%%%02X", (unsigned int)wc & 0xFF);
+            out += buf;
+        }
+        else {
+            // Non-ASCII: convert wchar to UTF-8 bytes then percent-encode each byte
+            char utf8[8] = {};
+            int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, utf8, (int)sizeof(utf8), NULL, NULL);
+            for (int i = 0; i < n; ++i) {
+                wchar_t buf[4];
+                swprintf_s(buf, L"%%%02X", (unsigned char)utf8[i]);
+                out += buf;
+            }
+        }
+    }
+    return out;
+}
+
+// Convert UTF-16 string to ANSI (current code page) in a std::string
+inline std::string WideToAnsi(const std::wstring& w)
+{
+    int needed = WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
+    if (needed <= 0) return std::string();
+    std::string out;
+    out.resize(needed);
+    WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), &out[0], needed, NULL, NULL);
+    return out;
+}
+
 // helper: percent-decode bytes into UTF-8 then to wstring
-static std::wstring PercentDecodeUtf8ToW(const std::wstring& s)
+inline std::wstring PercentDecodeUtf8ToW(const std::wstring& s)
 {
 	// If no percent, return original
 	if (s.find(L'%') == std::wstring::npos) return s;
@@ -56,7 +105,7 @@ static std::wstring PercentDecodeUtf8ToW(const std::wstring& s)
 }
 
 // helper: normalize an M3U entry line into a Windows path or URL
-static std::wstring NormalizeM3UEntry(const std::wstring& raw)
+inline std::wstring NormalizeM3UEntry(const std::wstring& raw)
 {
 	if (raw.empty()) return raw;
 

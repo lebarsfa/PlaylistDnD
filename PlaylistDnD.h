@@ -420,22 +420,19 @@ public:
 		if (!pFormatEtc || !pMedium) return E_POINTER;
 
 		// debug log
-		wchar_t dbg[512];
+		wchar_t dbg[1024];
 		swprintf_s(dbg, L"GetData: cf=%s (0x%08X) tymed=0x%X lindex=%d\n",
 			FormatIdToName(pFormatEtc->cfFormat).c_str(),
 			pFormatEtc->cfFormat, pFormatEtc->tymed, pFormatEtc->lindex);
 		OutputDebugStringW(dbg);
-		if (pFormatEtc->cfFormat == RegisterClipboardFormatW(CFSTR_FILECONTENTS)) {
-			wchar_t dbg2[256];
-			swprintf_s(dbg2, L"GetData CFSTR_FILECONTENTS probe: tymed=0x%X lindex=%d\n", pFormatEtc->tymed, pFormatEtc->lindex);
-			OutputDebugStringW(dbg2);
-		}
 		if (pFormatEtc->cfFormat == CF_HDROP) {
-			// debug log
-			wchar_t dbg3[1024];
-			swprintf_s(dbg3, L"Returning CF_HDROP with %zu paths\n", _paths.size());
-			OutputDebugStringW(dbg3);
+			swprintf_s(dbg, L"Returning CF_HDROP with %zu paths\n", _paths.size());
+			OutputDebugStringW(dbg);
 			for (auto& pp : _paths) { OutputDebugStringW(pp.c_str()); OutputDebugStringW(L"\n"); }
+		}
+		if (pFormatEtc->cfFormat == RegisterClipboardFormatW(CFSTR_FILECONTENTS)) {
+			swprintf_s(dbg, L"GetData CFSTR_FILECONTENTS probe: tymed=0x%X lindex=%d\n", pFormatEtc->tymed, pFormatEtc->lindex);
+			OutputDebugStringW(dbg);
 		}
 
 		// CF_HDROP (TYMED_HGLOBAL)
@@ -461,28 +458,72 @@ public:
 			return S_OK;
 		}
 
-		// CFSTR_INETURLW (UniformResourceLocatorW) - UTF-16 newline-separated file:/// URLs
+#ifdef TESTING_FORMATETC
+		// CFSTR_INETURLW support - UTF-16 CRLF-separated file:/// URLs, double-NUL terminated
 		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
 		if (pFormatEtc->cfFormat == cfInetUrlW && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			// Build CRLF-separated, percent-encoded file:/// URLs (UTF-16)
 			std::wstring urls;
 			for (size_t i = 0; i < _paths.size(); ++i) {
-				const std::wstring& path = _paths[i];
+				std::wstring path = _paths[i];
+				// normalize to forward slashes and prefix file:///
 				std::wstring url = L"file:///";
 				for (wchar_t ch : path) url.push_back(ch == L'\\' ? L'/' : ch);
+				// percent-encode unsafe chars
+				///std::wstring enc = PercentEncodeUrlW(url);
+				//urls += enc;
 				urls += url;
 				if (i + 1 < _paths.size()) urls += L"\r\n";
 			}
-			SIZE_T bytes = (urls.size() + 1) * sizeof(wchar_t);
+			// Ensure double-NUL termination
+			urls.push_back(L'\0');
+			urls.push_back(L'\0');
+
+			SIZE_T bytes = urls.size() * sizeof(wchar_t);
 			HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
 			if (!hg) return E_OUTOFMEMORY;
 			void* dst = GlobalLock(hg);
 			memcpy(dst, urls.c_str(), bytes);
 			GlobalUnlock(hg);
+
 			pMedium->tymed = TYMED_HGLOBAL;
 			pMedium->hGlobal = hg;
 			pMedium->pUnkForRelease = nullptr;
 			return S_OK;
 		}
+
+		// ANSI variant: CFSTR_INETURL (narrow) - some targets expect ANSI CRLF-separated URLs
+		UINT cfInetUrlA = RegisterClipboardFormatA("UniformResourceLocator"); // CFSTR_INETURL (ANSI name)
+		if (pFormatEtc->cfFormat == cfInetUrlA && (pFormatEtc->tymed & TYMED_HGLOBAL)) {
+			// Build UTF-16 list first, then convert to ANSI code page
+			std::wstring urlsW;
+			for (size_t i = 0; i < _paths.size(); ++i) {
+				std::wstring path = _paths[i];
+				std::wstring url = L"file:///";
+				for (wchar_t ch : path) url.push_back(ch == L'\\' ? L'/' : ch);
+				//std::wstring enc = PercentEncodeUrlW(url);
+				//urlsW += enc;
+				urlsW += url;
+				if (i + 1 < _paths.size()) urlsW += L"\r\n";
+			}
+			// Convert to ANSI and double-NUL terminate
+			std::string urlsA = WideToAnsi(urlsW);
+			urlsA.push_back('\0');
+			urlsA.push_back('\0');
+
+			SIZE_T bytes = urlsA.size();
+			HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+			if (!hg) return E_OUTOFMEMORY;
+			void* dst = GlobalLock(hg);
+			memcpy(dst, urlsA.data(), bytes);
+			GlobalUnlock(hg);
+
+			pMedium->tymed = TYMED_HGLOBAL;
+			pMedium->hGlobal = hg;
+			pMedium->pUnkForRelease = nullptr;
+			return S_OK;
+		}
+#endif // TESTING_FORMATETC
 
 		// CF_PREFERREDDROPEFFECT - DWORD with DROPEFFECT_COPY
 		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
@@ -589,7 +630,6 @@ public:
 	}
 
 	HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
-#ifdef TESTING_QUERYGETDATA
 	HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* pFormatEtc) override {
 		if (!pFormatEtc) return E_POINTER;
 
@@ -602,8 +642,13 @@ public:
 
 		if (pFormatEtc->cfFormat == CF_HDROP && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
 
+#ifdef TESTING_FORMATETC
 		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
 		if (pFormatEtc->cfFormat == cfInetUrlW && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+
+		UINT cfInetUrlA = RegisterClipboardFormatA("UniformResourceLocator");
+		if (pFormatEtc->cfFormat == cfInetUrlA && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
+#endif // TESTING_FORMATETC
 
 		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
 		if (pFormatEtc->cfFormat == cfPref && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
@@ -621,13 +666,6 @@ public:
 
 		return DV_E_FORMATETC;
 	}
-#else
-	HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* pFormatEtc) override {
-		if (!pFormatEtc) return E_POINTER;
-		if ((pFormatEtc->cfFormat == CF_HDROP) && (pFormatEtc->tymed & TYMED_HGLOBAL)) return S_OK;
-		return DV_E_FORMATETC;
-	}
-#endif // TESTING_QUERYGETDATA
 	HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC* pFormatEtc, FORMATETC* pFormatEtcOut) override {
 		if (!pFormatEtcOut) return E_POINTER;
 		*pFormatEtcOut = *pFormatEtc;
@@ -643,12 +681,17 @@ public:
 
 		// Build the list of FORMATETC entries you support (CF_HDROP first)
 		std::vector<FORMATETC> fmts;
-		FORMATETC f = {};
-		f.cfFormat = CF_HDROP; f.tymed = TYMED_HGLOBAL; f.dwAspect = DVASPECT_CONTENT; f.lindex = -1; f.ptd = nullptr;
-		fmts.push_back(f);
+		FORMATETC f = {}; f.dwAspect = DVASPECT_CONTENT; f.lindex = -1; f.ptd = nullptr;
 
+		f.cfFormat = CF_HDROP; f.tymed = TYMED_HGLOBAL; fmts.push_back(f);
+
+#ifdef TESTING_FORMATETC
 		UINT cfInetUrlW = RegisterClipboardFormatW(CFSTR_INETURLW);
 		if (cfInetUrlW) { f.cfFormat = (CLIPFORMAT)cfInetUrlW; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+
+		UINT cfInetUrlA = RegisterClipboardFormatA("UniformResourceLocator");
+		if (cfInetUrlA) { f.cfFormat = (CLIPFORMAT)cfInetUrlA; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
+#endif // TESTING_FORMATETC
 
 		UINT cfPref = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
 		if (cfPref) { f.cfFormat = (CLIPFORMAT)cfPref; f.tymed = TYMED_HGLOBAL; fmts.push_back(f); }
