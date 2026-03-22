@@ -23,6 +23,17 @@ IDropTarget* g_dropTarget = nullptr;
 int g_sortColumn = 0;
 bool g_sortAscending = true;
 
+struct ItemData {
+    std::wstring fullPath;
+    std::wstring nameOnly;
+    ULONGLONG durationMs;
+	// Column 0: name without extension, Column 1: extension, Column 2: length, Column 3: directory
+    std::wstring nameOnlyNoExt;
+	std::wstring extension;
+	std::wstring length;
+	std::wstring directory;
+};
+
 struct DragTrackState {
 	bool tracking = false;
 	POINT downPt = { 0,0 }; // client coords

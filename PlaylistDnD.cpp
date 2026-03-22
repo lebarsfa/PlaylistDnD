@@ -1,21 +1,6 @@
 #include "framework.h"
 #include "PlaylistDnD.h"
 
-void FreeAllListViewItems(HWND hList) {
-	if (!IsWindow(hList)) return;
-	int count = ListView_GetItemCount(hList);
-	for (int i = 0; i < count; ++i) {
-		LVITEMW it = {};
-		it.mask = LVIF_PARAM;
-		it.iItem = i;
-		if (ListView_GetItem(hList, &it)) {
-			std::wstring* p = reinterpret_cast<std::wstring*>(it.lParam);
-			delete p;
-		}
-	}
-	ListView_DeleteAllItems(hList);
-}
-
 void UpdateListViewColumns(HWND hList)
 {
 	if (!IsWindow(hList)) return;
@@ -25,6 +10,77 @@ void UpdateListViewColumns(HWND hList)
 	if (!g_colUserSized[3]) ListView_SetColumnWidth(hList, 3, LVSCW_AUTOSIZE_USEHEADER);
 }
 
+void FreeAllListViewItems(HWND hList) {
+	if (!IsWindow(hList)) return;
+	int count = ListView_GetItemCount(hList);
+	for (int i = 0; i < count; ++i) {
+		LVITEMW it = {};
+		it.mask = LVIF_PARAM;
+		it.iItem = i;
+		if (ListView_GetItem(hList, &it)) {
+			ItemData* p = reinterpret_cast<ItemData*>(it.lParam);
+			delete p;
+		}
+	}
+	ListView_DeleteAllItems(hList);
+}
+
+int InsertItemDataToListView(HWND hList, int insertIndex, ItemData* pData)
+{
+	if (!IsWindow(hList)) return -1;
+	if (!pData) return -1;
+
+	LVITEMW item = {};
+	item.mask = LVIF_TEXT | LVIF_PARAM;
+	item.iItem = insertIndex;
+	item.iSubItem = 0;
+	item.lParam = (LPARAM)pData;
+	item.pszText = const_cast<LPWSTR>(pData->nameOnlyNoExt.c_str());
+	int idx = ListView_InsertItem(hList, &item); // InsertItem inserts at iItem; if iItem == count it appends
+	if (idx >= 0) {
+		ListView_SetItemText(hList, idx, 1, const_cast<LPWSTR>(pData->extension.c_str()));
+		ListView_SetItemText(hList, idx, 2, const_cast<LPWSTR>(pData->length.c_str()));
+		ListView_SetItemText(hList, idx, 3, const_cast<LPWSTR>(pData->directory.c_str()));
+	}
+	return idx;
+}
+
+int InsertPathToListView(HWND hList, int insertIndex, const std::wstring& fullPath)
+{
+	if (!IsWindow(hList)) return -1;
+	size_t ppos = fullPath.find_last_of(L"\\/");
+	std::wstring directory = (ppos == std::wstring::npos) ? L"" : fullPath.substr(0, ppos);
+	std::wstring nameOnly = (ppos == std::wstring::npos) ? fullPath : fullPath.substr(ppos + 1);
+	size_t dot = nameOnly.find_last_of(L'.');
+	std::wstring nameOnlyNoExt = (dot == std::wstring::npos) ? nameOnly : nameOnly.substr(0, dot);
+	std::wstring extension = (dot == std::wstring::npos) ? L"" : nameOnly.substr(dot);
+	ULONGLONG durationMs = GetMediaDurationMs(fullPath);
+	std::wstring length = FormatDurationMs(durationMs);
+
+	ItemData* pData = new ItemData();
+	if (!pData) return -1;
+	pData->fullPath = fullPath;
+	pData->nameOnly = nameOnly;
+	pData->durationMs = durationMs;
+	pData->nameOnlyNoExt = nameOnlyNoExt;
+	pData->extension = extension;
+	pData->length = length;
+	pData->directory = directory;
+
+	return InsertItemDataToListView(hList, insertIndex, pData);
+}
+
+int GetListViewItemText(HWND hList, int itemIndex, int subItem, wchar_t* buf, int bufChars)
+{
+	if (!IsWindow(hList) || !buf || bufChars <= 0) return 0;
+	LVITEMW lv = {};
+	lv.iSubItem = subItem;
+	lv.cchTextMax = bufChars;
+	lv.pszText = buf;
+	// LVM_GETITEMTEXTW returns number of characters copied (not including terminating null)
+	return (int)SendMessageW(hList, LVM_GETITEMTEXTW, (WPARAM)itemIndex, (LPARAM)&lv);
+}
+
 void ShuffleListView(HWND hList)
 {
 	if (!IsWindow(hList)) return;
@@ -32,24 +88,25 @@ void ShuffleListView(HWND hList)
 	int count = ListView_GetItemCount(hList);
 	if (count <= 1) return;
 
-	// 1) Collect pointers (lParam) in order
-	std::vector<std::wstring*> items;
+	std::vector<ItemData*> items;
 	items.reserve(count);
+
+	// 1) Collect lParam pointers and cached subitem texts
+	const int BUF_CHARS = MAX_PATH;
+	std::vector<wchar_t> buf(BUF_CHARS);
 	for (int i = 0; i < count; ++i) {
 		LVITEMW it = {};
 		it.mask = LVIF_PARAM;
 		it.iItem = i;
-		if (ListView_GetItem(hList, &it)) {
-			std::wstring* p = reinterpret_cast<std::wstring*>(it.lParam);
-			items.push_back(p);
-		}
-		else {
+		if (!ListView_GetItem(hList, &it)) {
 			items.push_back(nullptr);
+			continue;
 		}
+		items.push_back(reinterpret_cast<ItemData*>(it.lParam));
 	}
 
-	// 2) Save selected pointers so we can reselect them after shuffle
-	std::vector<std::wstring*> selectedPtrs;
+	// 2) Save selected pointers
+	std::vector<ItemData*> selectedPtrs;
 	int idx = -1;
 	while (true) {
 		idx = ListView_GetNextItem(hList, idx, LVNI_SELECTED);
@@ -58,60 +115,33 @@ void ShuffleListView(HWND hList)
 		it.mask = LVIF_PARAM;
 		it.iItem = idx;
 		if (ListView_GetItem(hList, &it)) {
-			selectedPtrs.push_back(reinterpret_cast<std::wstring*>(it.lParam));
+			selectedPtrs.push_back(reinterpret_cast<ItemData*>(it.lParam));
 		}
 	}
 
-	// 3) Shuffle using random_device + mt19937
+	// 3) Shuffle
 	std::random_device rd;
 	std::mt19937 g(rd());
 	std::shuffle(items.begin(), items.end(), g);
 
-	// 4) Remove all items from the ListView (do NOT free lParam pointers here)
+	// 4) Remove all items (do not free lParam)
 	ListView_DeleteAllItems(hList);
 
-	// 5) Reinsert items in shuffled order, reusing the same lParam pointers
+	// 5) Reinsert using cached strings and original lParam pointers
 	for (size_t i = 0; i < items.size(); ++i) {
-		std::wstring* pFull = items[i];
-		std::wstring nameOnlyNoExt = L"";
-		std::wstring extension = L"";
-		std::wstring length = L"";
-		std::wstring directory = L"";
-		if (pFull && !pFull->empty()) {
-			std::wstring filename = *pFull;
-			size_t ppos = filename.find_last_of(L"\\/");
-			directory = (ppos == std::wstring::npos) ? L"" : filename.substr(0, ppos);
-			std::wstring nameOnly = (ppos == std::wstring::npos) ? filename : filename.substr(ppos + 1);
-			size_t dot = nameOnly.find_last_of(L'.');
-			nameOnlyNoExt = (dot == std::wstring::npos) ? nameOnly : nameOnly.substr(0, dot);
-			extension = (dot == std::wstring::npos) ? L"" : nameOnly.substr(dot);
-			length = FormatDurationMs(GetMediaDurationMs(filename));
-		}
-
-		LVITEMW item = {};
-		item.mask = LVIF_TEXT | LVIF_PARAM;
-		item.iItem = ListView_GetItemCount(hList);
-		item.iSubItem = 0;
-		item.pszText = const_cast<LPWSTR>(nameOnlyNoExt.c_str());
-		item.lParam = (LPARAM)pFull;
-		int newIdx = ListView_InsertItem(hList, &item);
-		if (newIdx >= 0) {
-			ListView_SetItemText(hList, newIdx, 1, const_cast<LPWSTR>(extension.c_str()));
-			ListView_SetItemText(hList, newIdx, 2, const_cast<LPWSTR>(length.c_str()));
-			ListView_SetItemText(hList, newIdx, 3, const_cast<LPWSTR>(directory.c_str()));
-		}
+		InsertItemDataToListView(hList, ListView_GetItemCount(hList), items[i]);
 	}
 
-	// 6) Restore selection: find items whose lParam is in selectedPtrs
+	// 6) Restore selection
 	if (!selectedPtrs.empty()) {
-		for (int i = 0; i < ListView_GetItemCount(hList); ++i) {
+		int newCount = ListView_GetItemCount(hList);
+		for (int i = 0; i < newCount; ++i) {
 			LVITEMW it = {};
 			it.mask = LVIF_PARAM;
 			it.iItem = i;
 			if (ListView_GetItem(hList, &it)) {
-				std::wstring* p = reinterpret_cast<std::wstring*>(it.lParam);
+				ItemData* p = reinterpret_cast<ItemData*>(it.lParam);
 				if (p) {
-					// linear search in selectedPtrs (small lists are fine)
 					for (auto sp : selectedPtrs) {
 						if (sp == p) {
 							ListView_SetItemState(hList, i, LVIS_SELECTED, LVIS_SELECTED);
@@ -121,17 +151,17 @@ void ShuffleListView(HWND hList)
 				}
 			}
 		}
-		// set focus to first selected item
 		int firstSel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
 		if (firstSel != -1) ListView_SetItemState(hList, firstSel, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
 	}
 
-	// 7) Update columns (respects g_colUserSized[]) and repaint
+	// 7) Refresh
 	UpdateListViewColumns(hList);
 	InvalidateRect(hList, NULL, TRUE);
 	UpdateWindow(hList);
 }
 
+// Not used any more...?
 void LoadM3UToList(HWND hList, const std::wstring& playlistPath)
 {
 	if (!IsWindow(hList)) return;
@@ -174,57 +204,12 @@ void LoadM3UToList(HWND hList, const std::wstring& playlistPath)
 			OutputDebugStringW(L"\n");
 		}
 
-		std::wstring filename = resolved;
-		size_t ppos = filename.find_last_of(L"\\/");
-		std::wstring directory = (ppos == std::wstring::npos) ? L"" : filename.substr(0, ppos);
-		std::wstring nameOnly = (ppos == std::wstring::npos) ? filename : filename.substr(ppos + 1);
-		size_t dot = nameOnly.find_last_of(L'.');
-		std::wstring nameOnlyNoExt = (dot == std::wstring::npos) ? nameOnly : nameOnly.substr(0, dot);
-		std::wstring extension = (dot == std::wstring::npos) ? L"" : nameOnly.substr(dot);
-		std::wstring length = FormatDurationMs(GetMediaDurationMs(filename));
-
-		LVITEMW item = {};
-		item.mask = LVIF_TEXT | LVIF_PARAM;
-		item.iItem = ListView_GetItemCount(hList);
-		item.iSubItem = 0;
-		item.pszText = const_cast<LPWSTR>(nameOnlyNoExt.c_str());
-		item.lParam = (LPARAM)new std::wstring(resolved);
-		int idx = ListView_InsertItem(hList, &item);
-		if (idx >= 0) {
-			ListView_SetItemText(hList, idx, 1, const_cast<LPWSTR>(extension.c_str()));
-			ListView_SetItemText(hList, idx, 2, const_cast<LPWSTR>(length.c_str()));
-			ListView_SetItemText(hList, idx, 3, const_cast<LPWSTR>(directory.c_str()));
+		if (InsertPathToListView(hList, ListView_GetItemCount(hList), resolved) >= 0) {
 			++added;
 		}
 	}
 
 	if (ListView_GetItemCount(hList) > 0) ListView_SetItemState(hList, 0, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
-}
-
-void InsertPathToListView(HWND hList, const std::wstring& fullPath)
-{
-	if (!IsWindow(hList)) return;
-	std::wstring filename = fullPath;
-	size_t pos = filename.find_last_of(L"\\/");
-	std::wstring directory = (pos == std::wstring::npos) ? L"" : filename.substr(0, pos);
-	std::wstring nameOnly = (pos == std::wstring::npos) ? filename : filename.substr(pos + 1);
-	size_t dot = nameOnly.find_last_of(L'.');
-	std::wstring nameOnlyNoExt = (dot == std::wstring::npos) ? nameOnly : nameOnly.substr(0, dot);
-	std::wstring extension = (dot == std::wstring::npos) ? L"" : nameOnly.substr(dot);
-	std::wstring length = FormatDurationMs(GetMediaDurationMs(filename));
-
-	LVITEMW item = {};
-	item.mask = LVIF_TEXT | LVIF_PARAM;
-	item.iItem = ListView_GetItemCount(hList);
-	item.iSubItem = 0;
-	item.pszText = const_cast<LPWSTR>(nameOnlyNoExt.c_str());
-	item.lParam = (LPARAM)new std::wstring(fullPath);
-	int idx = ListView_InsertItem(hList, &item);
-	if (idx >= 0) {
-		ListView_SetItemText(hList, idx, 1, const_cast<LPWSTR>(extension.c_str()));
-		ListView_SetItemText(hList, idx, 2, const_cast<LPWSTR>(length.c_str()));
-		ListView_SetItemText(hList, idx, 3, const_cast<LPWSTR>(directory.c_str()));
-	}
 }
 
 std::wstring GetFullPathFromItem(HWND hList, int index)
@@ -234,8 +219,8 @@ std::wstring GetFullPathFromItem(HWND hList, int index)
 	it.iItem = index;
 	it.iSubItem = 0;
 	if (ListView_GetItem(hList, &it)) {
-		std::wstring* p = reinterpret_cast<std::wstring*>(it.lParam);
-		return p ? *p : std::wstring();
+		ItemData* p = reinterpret_cast<ItemData*>(it.lParam);
+		return p ? p->fullPath : std::wstring();
 	}
 	return std::wstring();
 }
@@ -277,7 +262,7 @@ void DeleteSelectedListViewItems(HWND hList)
 		it.mask = LVIF_PARAM;
 		it.iItem = idx;
 		if (ListView_GetItem(hList, &it)) {
-			std::wstring* p = reinterpret_cast<std::wstring*>(it.lParam);
+			ItemData* p = reinterpret_cast<ItemData*>(it.lParam);
 			delete p;
 		}
 		ListView_DeleteItem(hList, idx);
@@ -594,6 +579,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 	}
 
+				// Not used any more...?
 	case WM_APP + 1: {
 		std::wstring* p = (std::wstring*)lParam;
 		if (p) {
@@ -619,34 +605,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			// Insert each path in order at insertIndex, incrementing so order is preserved
 			for (auto& p : *vec) {
-				// prepare display strings
-				std::wstring filename = p;
-				size_t pos = filename.find_last_of(L"\\/");
-				std::wstring directory = (pos == std::wstring::npos) ? L"" : filename.substr(0, pos);
-				std::wstring nameOnly = (pos == std::wstring::npos) ? filename : filename.substr(pos + 1);
-				size_t dot = nameOnly.find_last_of(L'.');
-				std::wstring nameOnlyNoExt = (dot == std::wstring::npos) ? nameOnly : nameOnly.substr(0, dot);
-				std::wstring extension = (dot == std::wstring::npos) ? L"" : nameOnly.substr(dot);
-				std::wstring length = FormatDurationMs(GetMediaDurationMs(filename));
-
-				LVITEMW item = {};
-				item.mask = LVIF_TEXT | LVIF_PARAM;
-				item.iItem = insertIndex; // insert at this index
-				item.iSubItem = 0;
-				item.pszText = const_cast<LPWSTR>(nameOnlyNoExt.c_str());
-				item.lParam = (LPARAM)new std::wstring(p); // keep same ownership model as elsewhere
-
-				// InsertItem inserts at iItem; if iItem == count it appends
-				int newIdx = ListView_InsertItem(g_hList, &item);
+				int newIdx = InsertPathToListView(g_hList, insertIndex, p);
 				if (newIdx >= 0) {
-					ListView_SetItemText(g_hList, newIdx, 1, const_cast<LPWSTR>(extension.c_str()));
-					ListView_SetItemText(g_hList, newIdx, 2, const_cast<LPWSTR>(length.c_str()));
-					ListView_SetItemText(g_hList, newIdx, 3, const_cast<LPWSTR>(directory.c_str()));
 					// next insertion should go after this one
 					insertIndex = newIdx + 1;
 				}
 				else {
 					// fallback: append
+					InsertPathToListView(g_hList, ListView_GetItemCount(g_hList), p);
 					insertIndex = ListView_GetItemCount(g_hList);
 				}
 			}
@@ -802,42 +768,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				ListView_SortItems(g_hList, [](LPARAM l1, LPARAM l2, LPARAM lSort)->int {
 					int col = LOWORD(lSort);
 					bool asc = HIWORD(lSort) != 0;
-					std::wstring* a = reinterpret_cast<std::wstring*>(l1);
-					std::wstring* b = reinterpret_cast<std::wstring*>(l2);
+					ItemData* a = reinterpret_cast<ItemData*>(l1);
+					ItemData* b = reinterpret_cast<ItemData*>(l2);
 					if (!a || !b) return 0;
 					std::wstring va;
 					std::wstring vb;
 					if (col == 0) {
-						auto extract_name_no_ext = [](const std::wstring& full)->std::wstring {
-							size_t p = full.find_last_of(L"\\/");
-							std::wstring name = (p == std::wstring::npos) ? full : full.substr(p + 1);
-							size_t d = name.find_last_of(L'.');
-							return (d == std::wstring::npos) ? name : name.substr(0, d);
-							};
-						va = extract_name_no_ext(*a);
-						vb = extract_name_no_ext(*b);
+						va = a->nameOnlyNoExt;
+						vb = b->nameOnlyNoExt;
 					}
 					else if (col == 1) {
-						size_t pa = a->find_last_of(L"\\/");
-						std::wstring na = (pa == std::wstring::npos) ? *a : a->substr(pa + 1);
-						size_t da = na.find_last_of(L'.');
-						va = (da == std::wstring::npos) ? L"" : na.substr(da);
-						size_t pb = b->find_last_of(L"\\/");
-						std::wstring nb = (pb == std::wstring::npos) ? *b : b->substr(pb + 1);
-						size_t db = nb.find_last_of(L'.');
-						vb = (db == std::wstring::npos) ? L"" : nb.substr(db);
+						va = a->extension;
+						vb = b->extension;
 					}
 					else if (col == 2) {
-						ULONGLONG la = GetMediaDurationMs(*a);
-						ULONGLONG lb = GetMediaDurationMs(*b);
-						if (la < lb) return asc ? -1 : 1;
-						if (la > lb) return asc ? 1 : -1;
+						if (a->durationMs < b->durationMs) return asc ? -1 : 1;
+						if (a->durationMs > b->durationMs) return asc ? 1 : -1;
+						return 0;
 					}
-					else {
-						size_t pa = a->find_last_of(L"\\/");
-						va = (pa == std::wstring::npos) ? L"" : a->substr(0, pa);
-						size_t pb = b->find_last_of(L"\\/");
-						vb = (pb == std::wstring::npos) ? L"" : b->substr(0, pb);
+					else if (col == 3) {
+						va = a->directory;
+						vb = b->directory;
 					}
 					int cmp = _wcsicmp(va.c_str(), vb.c_str());
 					return asc ? cmp : -cmp;

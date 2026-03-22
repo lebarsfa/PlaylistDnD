@@ -12,6 +12,13 @@ inline std::wstring Trim(const std::wstring& s) {
     return s.substr(a, b - a + 1);
 }
 
+inline std::wstring extract_name_no_ext(const std::wstring& full) {
+	size_t p = full.find_last_of(L"\\/");
+	std::wstring name = (p == std::wstring::npos) ? full : full.substr(p + 1);
+	size_t d = name.find_last_of(L'.');
+	return (d == std::wstring::npos) ? name : name.substr(0, d);
+}
+
 inline std::wstring CombinePath(const std::wstring& baseDir, const std::wstring& relative) {
     if (relative.size() >= 2 && relative[1] == L':') return relative; // absolute
     if (!baseDir.empty() && (relative.size() >= 2 && relative[0] == L'\\' && relative[1] == L'\\')) return relative;
