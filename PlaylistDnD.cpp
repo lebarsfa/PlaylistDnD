@@ -1,7 +1,7 @@
 #include "framework.h"
 #include "PlaylistDnD.h"
 
-static void FreeAllListViewItems(HWND hList) {
+void FreeAllListViewItems(HWND hList) {
 	if (!IsWindow(hList)) return;
 	int count = ListView_GetItemCount(hList);
 	for (int i = 0; i < count; ++i) {
@@ -201,7 +201,7 @@ void LoadM3UToList(HWND hList, const std::wstring& playlistPath)
 	if (ListView_GetItemCount(hList) > 0) ListView_SetItemState(hList, 0, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
 }
 
-static void InsertPathToListView(HWND hList, const std::wstring& fullPath)
+void InsertPathToListView(HWND hList, const std::wstring& fullPath)
 {
 	if (!IsWindow(hList)) return;
 	std::wstring filename = fullPath;
@@ -227,7 +227,7 @@ static void InsertPathToListView(HWND hList, const std::wstring& fullPath)
 	}
 }
 
-static std::wstring GetFullPathFromItem(HWND hList, int index)
+std::wstring GetFullPathFromItem(HWND hList, int index)
 {
 	LVITEMW it = {};
 	it.mask = LVIF_PARAM;
@@ -240,7 +240,7 @@ static std::wstring GetFullPathFromItem(HWND hList, int index)
 	return std::wstring();
 }
 
-static std::vector<int> GetSelectedListViewIndices(HWND hList)
+std::vector<int> GetSelectedListViewIndices(HWND hList)
 {
 	std::vector<int> out;
 	int idx = -1;
@@ -769,7 +769,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}
 
 				// 2) vertical separators : calculer positions de colonnes
-				int colCount = 3; // ou ListView_GetColumnCount si vous gérez dynamiquement
+				int colCount = 4; // ou ListView_GetColumnCount si vous gérez dynamiquement
 				int x = 0;
 				// obtenir la position X du début (client left)
 				// itérer sur colonnes et additionner ListView_GetColumnWidth
