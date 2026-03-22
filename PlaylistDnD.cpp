@@ -70,17 +70,6 @@ int InsertPathToListView(HWND hList, int insertIndex, const std::wstring& fullPa
 	return InsertItemDataToListView(hList, insertIndex, pData);
 }
 
-int GetListViewItemText(HWND hList, int itemIndex, int subItem, wchar_t* buf, int bufChars)
-{
-	if (!IsWindow(hList) || !buf || bufChars <= 0) return 0;
-	LVITEMW lv = {};
-	lv.iSubItem = subItem;
-	lv.cchTextMax = bufChars;
-	lv.pszText = buf;
-	// LVM_GETITEMTEXTW returns number of characters copied (not including terminating null)
-	return (int)SendMessageW(hList, LVM_GETITEMTEXTW, (WPARAM)itemIndex, (LPARAM)&lv);
-}
-
 void ShuffleListView(HWND hList)
 {
 	if (!IsWindow(hList)) return;
@@ -159,57 +148,6 @@ void ShuffleListView(HWND hList)
 	UpdateListViewColumns(hList);
 	InvalidateRect(hList, NULL, TRUE);
 	UpdateWindow(hList);
-}
-
-// Not used any more...?
-void LoadM3UToList(HWND hList, const std::wstring& playlistPath)
-{
-	if (!IsWindow(hList)) return;
-	FreeAllListViewItems(hList);
-
-	std::vector<std::wstring> lines = ReadM3ULines(playlistPath);
-	if (lines.empty()) {
-		OutputDebugStringW(L"LoadM3UToList: no lines read.\n");
-		return;
-	}
-
-	std::wstring baseDir;
-	size_t pos = playlistPath.find_last_of(L"\\/");
-	if (pos != std::wstring::npos) baseDir = playlistPath.substr(0, pos);
-
-	//wchar_t prevDir[MAX_PATH] = { 0 };
-	//DWORD prevLen = GetCurrentDirectoryW(MAX_PATH, prevDir);
-
-	if (!baseDir.empty()) {
-		if (!SetCurrentDirectoryW(baseDir.c_str())) {
-			DWORD err = GetLastError();
-			wchar_t buf[256];
-			swprintf_s(buf, L"SetCurrentDirectoryW failed for '%s' (err=%u)\n", baseDir.c_str(), err);
-			OutputDebugStringW(buf);
-		}
-		else {
-			OutputDebugStringW(L"Current directory set to playlist folder.\n");
-		}
-	}
-
-	int added = 0;
-	for (const auto& raw : lines) {
-		if (raw.empty()) continue;
-		if (raw[0] == L'#') continue;
-
-		std::wstring resolved = ResolvePath(baseDir, raw);
-		if (GetFileAttributesW(resolved.c_str()) == INVALID_FILE_ATTRIBUTES) {
-			OutputDebugStringW(L"File not found: ");
-			OutputDebugStringW(resolved.c_str());
-			OutputDebugStringW(L"\n");
-		}
-
-		if (InsertPathToListView(hList, ListView_GetItemCount(hList), resolved) >= 0) {
-			++added;
-		}
-	}
-
-	if (ListView_GetItemCount(hList) > 0) ListView_SetItemState(hList, 0, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
 }
 
 std::wstring GetFullPathFromItem(HWND hList, int index)
@@ -576,19 +514,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 		InvalidateRect(hWnd, NULL, TRUE);
 		UpdateWindow(hWnd);
-		break;
-	}
-
-				// Not used any more...?
-	case WM_APP + 1: {
-		std::wstring* p = (std::wstring*)lParam;
-		if (p) {
-			LoadM3UToList(g_hList, *p);
-			delete p;
-			UpdateListViewColumns(g_hList);
-			InvalidateRect(g_hList, NULL, TRUE);
-			UpdateWindow(g_hList);
-		}
 		break;
 	}
 
