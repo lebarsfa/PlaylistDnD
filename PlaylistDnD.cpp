@@ -1,7 +1,7 @@
 #include "framework.h"
 #include "PlaylistDnD.h"
 
-void UpdateListViewColumns(HWND hList)
+void AutoSizeListViewColumns(HWND hList)
 {
 	if (!IsWindow(hList)) return;
 	if (!g_colUserSized[0]) ListView_SetColumnWidth(hList, 0, LVSCW_AUTOSIZE_USEHEADER);
@@ -145,7 +145,7 @@ void ShuffleListView(HWND hList)
 	}
 
 	// 7) Refresh
-	UpdateListViewColumns(hList);
+	//AutoSizeListViewColumns(hList);
 	InvalidateRect(hList, NULL, TRUE);
 	UpdateWindow(hList);
 }
@@ -205,7 +205,7 @@ void DeleteSelectedListViewItems(HWND hList)
 		}
 		ListView_DeleteItem(hList, idx);
 	}
-	UpdateListViewColumns(hList);
+	//AutoSizeListViewColumns(hList);
 }
 
 void StartDragFromListMulti(HWND hList)
@@ -378,15 +378,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		LVCOLUMNW col = {};
 		col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
-		col.cx = 200;;
+		col.cx = 200;
 		col.pszText = const_cast<LPWSTR>(L"Filename");
 		ListView_InsertColumn(g_hList, 0, &col);
 
-		col.cx = 25;
+		col.cx = 70;
 		col.pszText = const_cast<LPWSTR>(L"Extension");
 		ListView_InsertColumn(g_hList, 1, &col);
 
-		col.cx = 25;
+		col.cx = 55;
 		col.pszText = const_cast<LPWSTR>(L"Length");
 		ListView_InsertColumn(g_hList, 2, &col);
 
@@ -488,13 +488,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				max(0, cx - margin * 2), listHeight,
 				SWP_NOZORDER | SWP_SHOWWINDOW);
 
-			int clientWidth = max(0, cx - margin * 6);
-			int col0 = (int)(clientWidth * 0.45);
-			int col1 = (int)(clientWidth * 0.05);
-			int col2 = (int)(clientWidth * 0.05);
-			int col3 = (int)(clientWidth * 0.45);// clientWidth - col0 - col1 - col2;
-
 			const int minCol = 40;
+			int clientWidth = max(0, cx - margin * 6); // Need to leave some space so that we can unselect columns easily...
+			int col1 = (int)70;
+			int col2 = (int)55;
+			int col0 = (int)((clientWidth - col1 - col2) * 0.50);
+			int col3 = (int)((clientWidth - col1 - col2) * 0.50);
+
 			if (col0 < minCol) col0 = minCol;
 			if (col1 < minCol) col1 = minCol;
 			if (col2 < minCol) col2 = minCol;
@@ -547,7 +547,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			// re-enable redraw and refresh
 			SendMessageW(g_hList, WM_SETREDRAW, TRUE, 0);
-			UpdateListViewColumns(g_hList);
+			//AutoSizeListViewColumns(g_hList);
 			InvalidateRect(g_hList, NULL, TRUE);
 			UpdateWindow(g_hList);
 		}
