@@ -228,6 +228,7 @@ inline std::vector<std::wstring> ReadM3ULines(const std::wstring& path)
 		if (i == wide.size() || wide[i] == L'\n') {
 			size_t len = (i > 0 && wide[i-1] == L'\r') ? (i - 1 - start) : (i - start);
 			std::wstring line = wide.substr(start, len);
+
 			// Trim whitespace
 			size_t a = line.find_first_not_of(L" \t\r\n");
 			if (a != std::wstring::npos) {
@@ -235,11 +236,21 @@ inline std::vector<std::wstring> ReadM3ULines(const std::wstring& path)
 				line = line.substr(a, b - a + 1);
 			}
 			else line.clear();
+
+			// Skip empty lines and comment/tag lines that start with '#'
 			if (!line.empty()) {
-				// Normalize percent-encoding and slashes
-				std::wstring normalized = NormalizeM3UEntry(line);
-				if (!normalized.empty()) out.push_back(normalized);
-			}            start = i + 1;
+				if (line[0] == L'#') {
+					// skip tags/comments like #EXTM3U, #EXTINF, #EXT-X-...
+					// advance to next line without adding to output
+				}
+				else {
+					// Normalize percent-encoding and slashes
+					std::wstring normalized = NormalizeM3UEntry(line);
+					if (!normalized.empty()) out.push_back(normalized);
+				}
+			}
+
+			start = i + 1;
 		}
 	}
 	return out;

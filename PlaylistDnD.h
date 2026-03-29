@@ -835,7 +835,7 @@ public:
 						size_t bpos = p.find_last_of(L"\\/");
 						std::wstring baseDir = (bpos == std::wstring::npos) ? L"" : p.substr(0, bpos);
 						for (auto& ln : lines) {
-							if (ln.empty() || ln[0] == L'#') continue;
+							if (ln.empty()) continue;
 							std::wstring resolved = ResolvePath(baseDir, ln);
 							if (GetFileAttributesW(resolved.c_str()) != INVALID_FILE_ATTRIBUTES) {
 								collected->push_back(resolved);
