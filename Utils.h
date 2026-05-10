@@ -62,3 +62,32 @@ inline void AddFileIfExists(std::vector<std::wstring>& out, const std::wstring& 
 		out.push_back(path);
 	}
 }
+
+inline bool IsValidUtf8(const std::string& bytes) {
+	size_t i = 0, n = bytes.size();
+	while (i < n) {
+		unsigned char c = (unsigned char)bytes[i];
+		if (c <= 0x7F) { i++; continue; }
+		if ((c & 0xE0) == 0xC0) { // 2-byte
+			if (i + 1 >= n) return false;
+			unsigned char c1 = (unsigned char)bytes[i+1];
+			if ((c1 & 0xC0) != 0x80) return false;
+			i += 2; continue;
+		}
+		if ((c & 0xF0) == 0xE0) { // 3-byte
+			if (i + 2 >= n) return false;
+			if (((unsigned char)bytes[i+1] & 0xC0) != 0x80) return false;
+			if (((unsigned char)bytes[i+2] & 0xC0) != 0x80) return false;
+			i += 3; continue;
+		}
+		if ((c & 0xF8) == 0xF0) { // 4-byte
+			if (i + 3 >= n) return false;
+			if (((unsigned char)bytes[i+1] & 0xC0) != 0x80) return false;
+			if (((unsigned char)bytes[i+2] & 0xC0) != 0x80) return false;
+			if (((unsigned char)bytes[i+3] & 0xC0) != 0x80) return false;
+			i += 4; continue;
+		}
+		return false;
+	}
+	return true;
+}

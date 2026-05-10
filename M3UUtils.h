@@ -181,7 +181,8 @@ inline std::vector<std::wstring> ReadM3ULines(const std::wstring& path)
 		for (size_t i = 0; i + 1 < bytes.size() && i < 200; i += 2) {
 			if (bytes[i+1] == 0x00) { maybeUtf16 = true; break; }
 		}
-		enc = maybeUtf16 ? ENC_UTF16_LE : ENC_UTF8;
+		bool validUtf8 = IsValidUtf8(bytes);
+		enc = maybeUtf16 ? ENC_UTF16_LE : (validUtf8 ? ENC_UTF8 : ENC_ANSI);
 	}
 
 	std::wstring wide;
@@ -206,19 +207,50 @@ inline std::vector<std::wstring> ReadM3ULines(const std::wstring& path)
 	else {
 		// UTF-8 (with or without BOM) or ANSI: convert to UTF-16 using MultiByteToWideChar
 		size_t offset = 0;
-		if (enc == ENC_UTF8_BOM) offset = 3;
-		int needed = MultiByteToWideChar(CP_UTF8, 0, bytes.data() + offset, (int)(bytes.size() - offset), NULL, 0);
-		if (needed > 0) {
-			wide.resize(needed);
-			MultiByteToWideChar(CP_UTF8, 0, bytes.data() + offset, (int)(bytes.size() - offset), &wide[0], needed);
+		if (bytes.size() >= 3 &&
+			(unsigned char)bytes[0] == 0xEF &&
+			(unsigned char)bytes[1] == 0xBB &&
+			(unsigned char)bytes[2] == 0xBF) {
+			offset = 3;
 		}
-		else {
-			// Fallback: treat as ANSI
-			int n2 = MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), NULL, 0);
-			if (n2 > 0) {
-				wide.resize(n2);
-				MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), &wide[0], n2);
+
+		auto convert_utf8 = [&](std::wstring& out)->bool {
+			int needed = MultiByteToWideChar(CP_UTF8, 0, bytes.data() + offset, (int)(bytes.size() - offset), NULL, 0);
+			if (needed <= 0) return false;
+			out.resize(needed);
+			MultiByteToWideChar(CP_UTF8, 0, bytes.data() + offset, (int)(bytes.size() - offset), &out[0], needed);
+			return true;
+			};
+
+		auto convert_ansi = [&](std::wstring& out)->bool {
+			int needed = MultiByteToWideChar(CP_ACP, 0, bytes.data() + offset, (int)(bytes.size() - offset), NULL, 0);
+			if (needed <= 0) return false;
+			out.resize(needed);
+			MultiByteToWideChar(CP_ACP, 0, bytes.data() + offset, (int)(bytes.size() - offset), &out[0], needed);
+			return true;
+			};
+
+		if (enc == ENC_UTF8) {
+			if (!convert_utf8(wide)) {
+				// UTF-8 conversion failed entirely, try ANSI
+				convert_ansi(wide);
 			}
+			else {
+				// Heuristic: detect suspicious result (replacement chars or many '?')
+				int bad = 0;
+				for (wchar_t wc : wide) {
+					if (wc == 0xFFFD || wc == L'?') ++bad;
+				}
+				if (!wide.empty() && (double)bad / (double)wide.size() > 0.02) {
+					// fallback to ANSI if UTF-8 looks wrong
+					if (convert_ansi(wide)) {
+						enc = ENC_ANSI; // record that we used ANSI
+					}
+				}
+			}
+		}
+		else { // ENC_ANSI
+			convert_ansi(wide);
 		}
 	}
 
